@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+contract DecentralizedLoanSystem {
+    address public admin;
+    uint256 public loanIdCounter;
+    IERC20 public stablecoin; // USDC or DAI for loan disbursement
+    AggregatorV3Interface public creditScoreOracle; // AI-based credit score oracle
+
+    struct Loan {
+        address borrower;
+        uint256 amount;
+        uint256 interestRate;
+        uint256 duration;
+        address collateralNFT;
+        uint256 collateralTokenId;
+        uint256 issuedTime;
+        bool isRepaid;
+        bool isDefaulted;
+    }
+
+    mapping(uint256 => Loan) public loans;
+    mapping(address => uint256) public creditScores;
+    mapping(address => bool) public verifiedUsers; // Stores KYC verification status
+
+    event LoanRequested(uint256 loanId, address indexed borrower, uint256 amount);
+    event LoanApproved(uint256 loanId, address indexed borrower, uint256 amount);
+    event LoanRepaid(uint256 loanId, address indexed borrower);
+    event LoanDefaulted(uint256 loanId, address indexed borrower);
+    event CollateralLiquidated(uint256 loanId, address indexed borrower);
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin can perform this action");
+        _;
+    }
+
+    constructor(address _stablecoin, address _creditScoreOracle) {
+        admin = msg.sender;
+        stablecoin = IERC20(_stablecoin);
+        creditScoreOracle = AggregatorV3Interface(_creditScoreOracle);
+    }
+
+    function verifyUser(address user) external onlyAdmin {
+        verifiedUsers[user] = true;
+    }
+
+    function getCreditScore(address user) public view returns (uint256) {
+        (, int256 score, , , ) = creditScoreOracle.latestRoundData();
+        return uint256(score); // Fetches AI-based credit score
+    }
+
+    function requestLoan(uint256 amount, uint256 duration, address collateralNFT, uint256 collateralTokenId) external {
+        require(verifiedUsers[msg.sender], "User not KYC verified");
+        require(getCreditScore(msg.sender) > 600, "Low credit score");
+
+        loanIdCounter++;
+        IERC721(collateralNFT).transferFrom(msg.sender, address(this), collateralTokenId); // Lock collateral NFT
+
+        loans[loanIdCounter] = Loan(
+            msg.sender, amount, 5, duration, collateralNFT, collateralTokenId, block.timestamp, false, false
+        );
+
+        emit LoanRequested(loanIdCounter, msg.sender, amount);
+    }
+
+    function approveLoan(uint256 loanId) external onlyAdmin {
+        Loan storage loan = loans[loanId];
+        require(loan.borrower != address(0), "Loan does not exist");
+
+        stablecoin.transfer(loan.borrower, loan.amount); // Send stablecoins to borrower
+
+        emit LoanApproved(loanId, loan.borrower, loan.amount);
+    }
+
+    function repayLoan(uint256 loanId) external {
+        Loan storage loan = loans[loanId];
+        require(msg.sender == loan.borrower, "Not the borrower");
+        require(!loan.isRepaid, "Loan already repaid");
+
+        uint256 totalRepayment = loan.amount + (loan.amount * loan.interestRate) / 100; // Interest calculation
+        require(stablecoin.transferFrom(msg.sender, address(this), totalRepayment), "Repayment failed");
+
+        loan.isRepaid = true;
+        IERC721(loan.collateralNFT).transferFrom(address(this), msg.sender, loan.collateralTokenId); // Return NFT
+
+        emit LoanRepaid(loanId, msg.sender);
+    }
+
+    function checkLoanDefault(uint256 loanId) external {
+        Loan storage loan = loans[loanId];
+        require(!loan.isRepaid, "Loan already repaid");
+        require(block.timestamp > loan.issuedTime + loan.duration, "Loan not due yet");
+
+        loan.isDefaulted = true;
+        IERC721(loan.collateralNFT).transferFrom(address(this), admin, loan.collateralTokenId); // Liquidate NFT
+
+        emit LoanDefaulted(loanId, loan.borrower);
+        emit CollateralLiquidated(loanId, loan.borrower);
+    }
+}
